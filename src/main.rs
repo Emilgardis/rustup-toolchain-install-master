@@ -1,7 +1,7 @@
 #![warn(rust_2018_idioms)]
 
 use std::env::set_current_dir;
-use std::fs::{create_dir_all};
+use std::fs;
 use std::io::{stderr, stdout, Write};
 use std::iter::once;
 use std::ops::Deref;
@@ -22,7 +22,6 @@ use tar::Archive;
 use tee::TeeReader;
 use tempfile::{tempdir, tempdir_in};
 use xz2::read::XzDecoder;
-use fs_extra::dir::{CopyOptions, move_dir};
 
 static SUPPORTED_CHANNELS: &[&str] = &["nightly", "beta", "stable"];
 
@@ -181,7 +180,7 @@ fn download_tar_xz(
 
             match kind {
                 tar::EntryType::Directory => {
-                    create_dir_all(full_path)?;
+                    fs::create_dir_all(full_path)?;
                 }
                 tar::EntryType::Regular => {
                     entry.unpack(full_path)?;
@@ -241,6 +240,67 @@ fn install_component(
     Ok(())
 }
 
+fn install_single_toolchain_forced(
+    client: &Client,
+    maybe_dry_client: Option<&Client>,
+    prefix: &str,
+    toolchain_path: &Path,
+    toolchain: &Toolchain<'_>,
+    override_channel: Option<&str>,
+) -> Result<(),Error> {
+    use failure::format_err;
+    if maybe_dry_client.is_some() && toolchain_path.is_dir() {
+        remove_dir_all(&toolchain_path).with_context(|_| format_err!("Could not remove previous toolchain folder"))?;
+    }
+
+    let channel = if let Some(channel) = override_channel {
+        channel
+    } else {
+        get_channel(client, prefix, toolchain.commit)?
+    };
+
+    // download every component except rust-std.
+    for component in once(&"rustc").chain(toolchain.components) {
+        let component_filename = if *component == "rust-src" {
+            // rust-src is the only target-independent component
+            format!("{}-{}", component, channel)
+        } else {
+            format!("{}-{}-{}", component, channel, toolchain.host_target)
+        };
+        download_tar_xz(
+            maybe_dry_client,
+            &format!(
+                "{}/{}/{}.tar.xz",
+                prefix, toolchain.commit, &component_filename
+            ),
+            &toolchain.dest,
+            toolchain.commit,
+            component,
+            channel,
+            toolchain.host_target,
+        )?;
+    }
+
+    // download rust-std for every target.
+    for target in toolchain.rust_std_targets {
+        let rust_std_filename = format!("rust-std-{}-{}", channel, target);
+        download_tar_xz(
+            maybe_dry_client,
+            &format!(
+                "{}/{}/{}.tar.xz",
+                prefix, toolchain.commit, rust_std_filename
+            ),
+            &toolchain.dest,
+            toolchain.commit,
+            "rust-std",
+            channel,
+            target,
+        )?;
+    }
+    Ok(())
+}
+
+
 fn install_single_toolchain(
     client: &Client,
     maybe_dry_client: Option<&Client>,
@@ -254,54 +314,7 @@ fn install_single_toolchain(
     let mut updated = false;
     if toolchain_path.is_dir() {
         if force {
-            if maybe_dry_client.is_some() {
-                remove_dir_all(&toolchain_path)?;
-            }
-
-            let channel = if let Some(channel) = override_channel {
-                channel
-            } else {
-                get_channel(client, prefix, toolchain.commit)?
-            };
-        
-            // download every component except rust-std.
-            for component in once(&"rustc").chain(toolchain.components) {
-                let component_filename = if *component == "rust-src" {
-                    // rust-src is the only target-independent component
-                    format!("{}-{}", component, channel)
-                } else {
-                    format!("{}-{}-{}", component, channel, toolchain.host_target)
-                };
-                download_tar_xz(
-                    maybe_dry_client,
-                    &format!(
-                        "{}/{}/{}.tar.xz",
-                        prefix, toolchain.commit, &component_filename
-                    ),
-                    &toolchain.dest,
-                    toolchain.commit,
-                    component,
-                    channel,
-                    toolchain.host_target,
-                )?;
-            }
-        
-            // download rust-std for every target.
-            for target in toolchain.rust_std_targets {
-                let rust_std_filename = format!("rust-std-{}-{}", channel, target);
-                download_tar_xz(
-                    maybe_dry_client,
-                    &format!(
-                        "{}/{}/{}.tar.xz",
-                        prefix, toolchain.commit, rust_std_filename
-                    ),
-                    &toolchain.dest,
-                    toolchain.commit,
-                    "rust-std",
-                    channel,
-                    target,
-                )?;
-            }
+            install_single_toolchain_forced(client, maybe_dry_client, prefix, &toolchain_path, toolchain, override_channel)?;
         } else if !toolchain.components.is_empty() {
             updated = true;
             for component in toolchain.components {
@@ -314,11 +327,13 @@ fn install_single_toolchain(
             );
             return Ok(());
         }
+    } else {
+        install_single_toolchain_forced(client, maybe_dry_client, prefix, &toolchain_path, toolchain, override_channel)?;
     }
 
     // install
     if maybe_dry_client.is_some() {
-        move_dir(&toolchain.dest, toolchain_path, &CopyOptions::new())?;
+        rename(&toolchain.dest, toolchain_path)?;
         if !updated {
             eprintln!(
                 "toolchain `{}` is successfully installed!",
@@ -479,7 +494,7 @@ fn run() -> Result<(), Error> {
     let toolchains_dir = {
         let path = rustup_home.join("tmp");
         if !path.exists() {
-            create_dir_all(&path)?;
+            fs::create_dir_all(&path)?;
         }
         if path.is_dir() {
             tempdir_in(&path)
@@ -561,6 +576,30 @@ fn report_warn(warn: &dyn Fail) {
         eprintln!("{} {}", Yellow.bold().paint("caused by:"), cause);
     }
     eprintln!("");
+}
+
+fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> Result<(),Error> {
+    use walkdir::WalkDir;
+    use failure::format_err;
+    let from = from.as_ref();
+    let to = to.as_ref();
+    if fs::rename(from, to).with_context(|_| format_err!("Could not move toolchain folder from temp folder")).is_ok() {
+        return Ok(())
+    }
+    for entry in WalkDir::new(from).min_depth(1) {
+        let entry = entry.with_context(|e| format_err!("Could not get directory entry from `{:?}`", e.path()))?;
+        let entry = entry.path();
+        let path_with_root: std::path::PathBuf = entry.components().skip(1).collect();
+        let mut to = to.to_path_buf();
+        to.push(path_with_root);
+        if !entry.is_dir() {
+            if !entry.parent().map_or(false, |p| p.exists()) {
+                fs::create_dir(&to).with_context(|_| format_err!("Could not create directory `{}`", &to.display()))?;
+            }
+            fs::rename(&entry, &to).with_context(|_| format_err!("Could not move `{}` from temp directory to `{}`", &from.display(), &to.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn main() {
