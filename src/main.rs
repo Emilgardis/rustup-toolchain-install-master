@@ -1,7 +1,7 @@
 #![warn(rust_2018_idioms)]
 
 use std::env::set_current_dir;
-use std::fs::{create_dir_all, rename};
+use std::fs::{create_dir_all};
 use std::io::{stderr, stdout, Write};
 use std::iter::once;
 use std::ops::Deref;
@@ -22,6 +22,7 @@ use tar::Archive;
 use tee::TeeReader;
 use tempfile::{tempdir, tempdir_in};
 use xz2::read::XzDecoder;
+use fs_extra::dir::{CopyOptions, move_dir};
 
 static SUPPORTED_CHANNELS: &[&str] = &["nightly", "beta", "stable"];
 
@@ -205,6 +206,41 @@ struct Toolchain<'a> {
     dest: PathBuf,
 }
 
+fn install_component(
+    client: &Client,
+    maybe_dry_client: Option<&Client>,
+    prefix: &str,
+    toolchain: &Toolchain<'_>,
+    override_channel: Option<&str>,
+    component: &str,
+) -> Result<(), Error> {
+    let channel = if let Some(channel) = override_channel {
+        channel
+    } else {
+        get_channel(client, prefix, toolchain.commit)?
+    };
+
+    let component_filename = if component == "rust-src" {
+        // rust-src is the only target-independent component
+        format!("{}-{}", component, channel)
+    } else {
+        format!("{}-{}-{}", component, channel, toolchain.host_target)
+    };
+    download_tar_xz(
+        maybe_dry_client,
+        &format!(
+            "{}/{}/{}.tar.xz",
+            prefix, toolchain.commit, &component_filename
+        ),
+        &toolchain.dest,
+        toolchain.commit,
+        component,
+        channel,
+        toolchain.host_target,
+    ).with_context(|_| format!("Couldn't get tar.xz for component {}", component_filename))?;
+    Ok(())
+}
+
 fn install_single_toolchain(
     client: &Client,
     maybe_dry_client: Option<&Client>,
@@ -215,10 +251,61 @@ fn install_single_toolchain(
     force: bool,
 ) -> Result<(), Error> {
     let toolchain_path = toolchains_path.join(&toolchain.dest);
+    let mut updated = false;
     if toolchain_path.is_dir() {
         if force {
             if maybe_dry_client.is_some() {
                 remove_dir_all(&toolchain_path)?;
+            }
+
+            let channel = if let Some(channel) = override_channel {
+                channel
+            } else {
+                get_channel(client, prefix, toolchain.commit)?
+            };
+        
+            // download every component except rust-std.
+            for component in once(&"rustc").chain(toolchain.components) {
+                let component_filename = if *component == "rust-src" {
+                    // rust-src is the only target-independent component
+                    format!("{}-{}", component, channel)
+                } else {
+                    format!("{}-{}-{}", component, channel, toolchain.host_target)
+                };
+                download_tar_xz(
+                    maybe_dry_client,
+                    &format!(
+                        "{}/{}/{}.tar.xz",
+                        prefix, toolchain.commit, &component_filename
+                    ),
+                    &toolchain.dest,
+                    toolchain.commit,
+                    component,
+                    channel,
+                    toolchain.host_target,
+                )?;
+            }
+        
+            // download rust-std for every target.
+            for target in toolchain.rust_std_targets {
+                let rust_std_filename = format!("rust-std-{}-{}", channel, target);
+                download_tar_xz(
+                    maybe_dry_client,
+                    &format!(
+                        "{}/{}/{}.tar.xz",
+                        prefix, toolchain.commit, rust_std_filename
+                    ),
+                    &toolchain.dest,
+                    toolchain.commit,
+                    "rust-std",
+                    channel,
+                    target,
+                )?;
+            }
+        } else if !toolchain.components.is_empty() {
+            updated = true;
+            for component in toolchain.components {
+                install_component(client, maybe_dry_client, prefix, toolchain, override_channel, component)?;
             }
         } else {
             eprintln!(
@@ -229,58 +316,21 @@ fn install_single_toolchain(
         }
     }
 
-    let channel = if let Some(channel) = override_channel {
-        channel
-    } else {
-        get_channel(client, prefix, toolchain.commit)?
-    };
-
-    // download every component except rust-std.
-    for component in once(&"rustc").chain(toolchain.components) {
-        let component_filename = if *component == "rust-src" {
-            // rust-src is the only target-independent component
-            format!("{}-{}", component, channel)
-        } else {
-            format!("{}-{}-{}", component, channel, toolchain.host_target)
-        };
-        download_tar_xz(
-            maybe_dry_client,
-            &format!(
-                "{}/{}/{}.tar.xz",
-                prefix, toolchain.commit, &component_filename
-            ),
-            &toolchain.dest,
-            toolchain.commit,
-            component,
-            channel,
-            toolchain.host_target,
-        )?;
-    }
-
-    // download rust-std for every target.
-    for target in toolchain.rust_std_targets {
-        let rust_std_filename = format!("rust-std-{}-{}", channel, target);
-        download_tar_xz(
-            maybe_dry_client,
-            &format!(
-                "{}/{}/{}.tar.xz",
-                prefix, toolchain.commit, rust_std_filename
-            ),
-            &toolchain.dest,
-            toolchain.commit,
-            "rust-std",
-            channel,
-            target,
-        )?;
-    }
-
     // install
     if maybe_dry_client.is_some() {
-        rename(&toolchain.dest, toolchain_path)?;
-        eprintln!(
-            "toolchain `{}` is successfully installed!",
-            toolchain.dest.display()
-        );
+        move_dir(&toolchain.dest, toolchain_path, &CopyOptions::new())?;
+        if !updated {
+            eprintln!(
+                "toolchain `{}` is successfully installed!",
+                toolchain.dest.display()
+            );
+        } else {
+            eprintln!(
+                "toolchain `{}` is successfully updated!",
+                toolchain.dest.display()
+            );
+        }
+
     } else {
         eprintln!(
             "toolchain `{}` will be installed to `{}` on real run",
